@@ -37,7 +37,7 @@ library
     , containers
     , reducers >= 3.11
     , mtl
-    , reflex >= 0.5 && <0.6
+    , reflex >= 0.8 && <0.8.2
     , dlist
     , dependent-sum
     , transformers

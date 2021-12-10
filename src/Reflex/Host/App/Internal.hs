@@ -1,14 +1,15 @@
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE TupleSections #-}
-{-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE UndecidableInstances #-}
+
 -- | Module exposing the internal implementation of the host monad.
 -- There is no guarrante about stability of this module.
 -- If possible, use 'Reflex.Host.App' instead.
@@ -20,21 +21,21 @@ import Control.Monad.Reader
 import Control.Monad.Trans.Maybe
 import Control.Monad.Trans.RSS
 import Control.Monad.Writer.Class
+import qualified Data.DList as DL
 import Data.Dependent.Sum
+import qualified Data.Foldable as F
 import Data.Functor.Identity
 import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as M
 import Data.Maybe
-import Data.Monoid
+import Data.Monoid hiding (Ap, getAp)
 import Data.Semigroup.Applicative
-import Prelude
+import qualified Data.Traversable as T
 import Reflex.Class hiding (constant)
 import Reflex.Dynamic
 import Reflex.Host.Class
+import Prelude
 
-import qualified Data.DList as DL
-import qualified Data.Foldable as F
-import qualified Data.Map.Strict as M
-import qualified Data.Traversable as T
 --------------------------------------------------------------------------------
 
 -- | AppInputs are inputs to the application triggered by the external UI.
@@ -82,44 +83,50 @@ data AppInfo t = AppInfo
     -- and then return a trigger to fire the event. This guarrantes that the event is
     -- fired immediately after the frame has finished, even if other, external events
     -- are waiting.
-    eventsToPerform :: DL.DList (Event t (AppPerformAction t))
-
+    eventsToPerform :: DL.DList (Event t (AppPerformAction t)),
     -- | Events that, when fired, quit the application.
-  , eventsToQuit :: DL.DList (Event t ())
-
+    eventsToQuit :: DL.DList (Event t ()),
     -- | Delayed event triggers that will be fired immediately after the initial
     -- application setup has completed, before any external events are processed.
-  , triggersToFire :: Ap (HostFrame t) (DL.DList (DSum (EventTrigger t) Identity))
+    triggersToFire :: Ap (HostFrame t) (DL.DList (DSum (EventTrigger t) Identity))
   }
 
 -- | 'AppInfo' is a monoid. 'mappend' just merges the effects of both app infos.
 -- 'mempty' is an 'AppInfo' that has no effect at all when registered.
+instance Applicative (HostFrame t) => Semigroup (AppInfo t) where
+  (AppInfo a b c) <> (AppInfo a' b' c') =
+    AppInfo (mappend a a') (mappend b b') (mappend c c')
+
 instance Applicative (HostFrame t) => Monoid (AppInfo t) where
   mempty = AppInfo mempty mempty mempty
-  mappend (AppInfo a b c) (AppInfo a' b' c') =
-    AppInfo (mappend a a') (mappend b b') (mappend c c')
 
 -- | Produce an 'AppInfo' which only contains 'eventsToPerform'. This is useful in a
 -- monoid chain, like @infoToPerform toPerform <> infoToQuit toQuit@.
-infoPerform :: Applicative (HostFrame t)
-            => DL.DList (Event t (AppPerformAction t)) -> AppInfo t
-infoPerform x = mempty { eventsToPerform = x }
+infoPerform ::
+  Applicative (HostFrame t) =>
+  DL.DList (Event t (AppPerformAction t)) ->
+  AppInfo t
+infoPerform x = mempty {eventsToPerform = x}
 
 -- | Produce an 'AppInfo' which only contains 'eventsToQuit'.
 infoQuit :: Applicative (HostFrame t) => DL.DList (Event t ()) -> AppInfo t
-infoQuit x = mempty { eventsToQuit = x }
+infoQuit x = mempty {eventsToQuit = x}
 
 -- | Produce an 'AppInfo' which only contains 'triggersToFire'.
-infoFire :: Applicative (HostFrame t)
-           => HostFrame t (DL.DList (DSum (EventTrigger t) Identity)) -> AppInfo t
-infoFire x = mempty { triggersToFire = Ap x }
+infoFire ::
+  Applicative (HostFrame t) =>
+  HostFrame t (DL.DList (DSum (EventTrigger t) Identity)) ->
+  AppInfo t
+infoFire x = mempty {triggersToFire = Ap x}
 
 -- | Extract the 'eventsToPerform' and 'eventsToQuit' and merge each into a single event.
-appInfoEvents :: (Reflex t, Applicative (HostFrame t))
-              => AppInfo t -> (Event t (AppPerformAction t), Event t ())
-appInfoEvents AppInfo{..} =
-  ( mergeWith (liftA2 (<>)) $ DL.toList eventsToPerform
-  , leftmost $ DL.toList eventsToQuit
+appInfoEvents ::
+  (Reflex t, Applicative (HostFrame t)) =>
+  AppInfo t ->
+  (Event t (AppPerformAction t), Event t ())
+appInfoEvents AppInfo {..} =
+  ( mergeWith (liftA2 (<>)) $ DL.toList eventsToPerform,
+    leftmost $ DL.toList eventsToQuit
   )
 
 -- | Switch to a different 'AppInfo' whenever an 'Event' fires. Only the events of the
@@ -127,19 +134,23 @@ appInfoEvents AppInfo{..} =
 --
 -- This low-level primitive is used for implementing higher-level functions such as
 -- 'switchAppHost', 'performAppHost' or 'dynAppHost'.
-switchAppInfo :: (Reflex t, MonadHold t m, Applicative (HostFrame t))
-              => AppInfo t -> Event t (AppInfo t) -> m (AppInfo t)
+switchAppInfo ::
+  (Reflex t, MonadHold t m, Applicative (HostFrame t)) =>
+  AppInfo t ->
+  Event t (AppInfo t) ->
+  m (AppInfo t)
 switchAppInfo initialInfo updatedInfo = do
   toPerform <- switch <$> hold initialToPerform updatedToPerform
-  toQuit    <- switch <$> hold initialToQuit updatedToQuit
-  pure AppInfo
-    { eventsToPerform = pure toPerform <> pure (getAp . triggersToFire <$> updatedInfo)
-    , eventsToQuit = pure toQuit
-    , triggersToFire = triggersToFire initialInfo
-    }
- where
-  (updatedToPerform, updatedToQuit) = splitE $ fmap appInfoEvents updatedInfo
-  (initialToPerform, initialToQuit) = appInfoEvents initialInfo
+  toQuit <- switch <$> hold initialToQuit updatedToQuit
+  pure
+    AppInfo
+      { eventsToPerform = pure toPerform <> pure (getAp . triggersToFire <$> updatedInfo),
+        eventsToQuit = pure toQuit,
+        triggersToFire = triggersToFire initialInfo
+      }
+  where
+    (updatedToPerform, updatedToQuit) = splitE $ fmap appInfoEvents updatedInfo
+    (initialToPerform, initialToQuit) = appInfoEvents initialInfo
 
 -- | Switch to a different 'AppInfo' whenever an 'Event' fires. Only the events of the
 -- currently active application are performed. Unlike 'switchAppInfo' the primitive
@@ -150,11 +161,15 @@ switchAppInfo initialInfo updatedInfo = do
 -- This low-level primitive is used for implementing higher-level functions such as
 -- 'switchKeyAppHost'. Also this is key primitive of creation of dynamic collections of
 -- components/widgets.
-switchKeyAppInfo :: forall t m k .
-    (Reflex t, MonadHold t m, MonadFix m, Applicative (HostFrame t), Ord k)
-  => Map k (AppInfo t)                   -- ^ Initial FRP application
-  -> Event t (Map k (Maybe (AppInfo t))) -- ^ Updates, 'Nothing' deletes specified key and 'Just' adds/overwrite given key
-  -> m (AppInfo t)                       -- ^ Collected application info
+switchKeyAppInfo ::
+  forall t m k.
+  (Reflex t, MonadHold t m, MonadFix m, Applicative (HostFrame t), Ord k) =>
+  -- | Initial FRP application
+  Map k (AppInfo t) ->
+  -- | Updates, 'Nothing' deletes specified key and 'Just' adds/overwrite given key
+  Event t (Map k (Maybe (AppInfo t))) ->
+  -- | Collected application info
+  m (AppInfo t)
 switchKeyAppInfo initialMap updatedMap = do
   -- calculate eventsToPerform events
   let initialPerforms :: Map k (Event t (AppPerformAction t))
@@ -176,23 +191,25 @@ switchKeyAppInfo initialMap updatedMap = do
   toQuitMap <- switch . current . fmap mergeMap <$> foldDyn updateMap initialToQuit toQuitEvent
   let toQuit = F.foldMap id <$> toQuitMap
 
-  pure AppInfo {
-      eventsToPerform = pure toPerform <> pure updatedTriggers
-    , eventsToQuit    = pure toQuit
-    , triggersToFire  = F.foldMap id initialTriggers
-    }
- where
-  initialEvents = fmap appInfoEvents initialMap
-  updateEvents = fmap (fmap appInfoEvents) <$> updatedMap
-  initialTriggers = fmap triggersToFire initialMap
-  updatedTriggers = getAp . F.foldMap triggersToFire . M.mapMaybe id <$> updatedMap
+  pure
+    AppInfo
+      { eventsToPerform = pure toPerform <> pure updatedTriggers,
+        eventsToQuit = pure toQuit,
+        triggersToFire = F.foldMap id initialTriggers
+      }
+  where
+    initialEvents = fmap appInfoEvents initialMap
+    updateEvents = fmap (fmap appInfoEvents) <$> updatedMap
+    initialTriggers = fmap triggersToFire initialMap
+    updatedTriggers = getAp . F.foldMap triggersToFire . M.mapMaybe id <$> updatedMap
 
 -- | Helper to merge update map with current state
 updateMap :: Ord k => Map k (Maybe a) -> Map k a -> Map k a
 updateMap updMap curMap = M.foldlWithKey' go curMap updMap
- where
-  go m k Nothing = M.delete k m
-  go m k (Just v) = M.insert k v m
+  where
+    go m k Nothing = M.delete k m
+    go m k (Just v) = M.insert k v m
+
 --------------------------------------------------------------------------------
 
 -- | An implementation of the 'MonadAppHost' typeclass. You should not need to use this
@@ -201,23 +218,28 @@ updateMap updMap curMap = M.foldlWithKey' go curMap updMap
 newtype AppHost t a = AppHost
   { unAppHost :: RSST (AppEnv t) (Ap (HostFrame t) (AppInfo t)) () (HostFrame t) a
   }
+
 deriving instance ReflexHost t => Functor (AppHost t)
+
 deriving instance ReflexHost t => Applicative (AppHost t)
+
 deriving instance ReflexHost t => Monad (AppHost t)
 
 -- | 'AppHost' supports hold
 instance ReflexHost t => MonadHold t (AppHost t) where
-  hold            a b = AppHost $ lift $ hold a b
-  holdDyn         a b = AppHost $ lift $ holdDyn a b
+  hold a b = AppHost $ lift $ hold a b
+  holdDyn a b = AppHost $ lift $ holdDyn a b
   holdIncremental a b = AppHost $ lift $ holdIncremental a b
-  buildDynamic    a b = AppHost $ lift $ buildDynamic a b
-  headE           a   = AppHost $ lift $ headE a
+  buildDynamic a b = AppHost $ lift $ buildDynamic a b
+  headE a = AppHost $ lift $ headE a
+  now = AppHost $ lift $ now
 
 -- | 'AppHost' supports sample
 instance ReflexHost t => MonadSample t (AppHost t) where
   sample = AppHost . lift . sample
 
 deriving instance (MonadIO (HostFrame t), ReflexHost t) => MonadIO (AppHost t)
+
 deriving instance ReflexHost t => MonadFix (AppHost t)
 
 -- | You can subscribe to events in 'AppHost'
@@ -242,37 +264,42 @@ execAppHostFrame env (AppHost m) = do
 -- This function will block until the application exits (when one of the 'eventsToQuit'
 -- fires).
 hostApp :: (MonadIO m, MonadReflexHost t m) => AppHost t () -> m ()
-hostApp app = initHostApp app >>= F.mapM_ runStep where
-  runStep (chan, step) = do
-    nextInput <- liftIO (readChan chan)
-    step nextInput >>= flip when (runStep (chan, step))
+hostApp app = initHostApp app >>= F.mapM_ runStep
+  where
+    runStep (chan, step) = do
+      nextInput <- liftIO (readChan chan)
+      step nextInput >>= flip when (runStep (chan, step))
 
 -- | Initialize the application using a 'AppHost' monad. This function enables use
 -- of use an external control loop. It returns a step function to step the application
 -- based on external inputs received through the channel.
 -- The step function returns False when one of the 'eventsToQuit' is fired.
-initHostApp :: (ReflexHost t, MonadIO m, MonadReflexHost t m)
-            => AppHost t () -> m (Maybe (Chan (AppInputs t), AppInputs t -> m Bool))
+initHostApp ::
+  (ReflexHost t, MonadIO m, MonadReflexHost t m) =>
+  AppHost t () ->
+  m (Maybe (Chan (AppInputs t), AppInputs t -> m Bool))
 initHostApp app = do
   chan <- liftIO newChan
-  AppInfo{..} <- runHostFrame $ execAppHostFrame (AppEnv chan) app
+  AppInfo {..} <- runHostFrame $ execAppHostFrame (AppEnv chan) app
   nextActionEvent <- subscribeEvent $ mergeWith (liftA2 (<>)) $ DL.toList eventsToPerform
   quitEvent <- subscribeEvent $ mergeWith mappend $ DL.toList eventsToQuit
 
-  let
-    go [] = return ()
-    go triggers = do
-      (nextAction, continue) <- lift $ fireEventsAndRead triggers $
-        (,) <$> eventValue nextActionEvent <*> fmap isNothing (readEvent quitEvent)
-      guard continue
-      maybe (return mempty) (lift . runHostFrame) nextAction >>= go . DL.toList
+  let go [] = return ()
+      go triggers = do
+        (nextAction, continue) <-
+          lift $
+            fireEventsAndRead triggers $
+              (,) <$> eventValue nextActionEvent <*> fmap isNothing (readEvent quitEvent)
+        guard continue
+        maybe (return mempty) (lift . runHostFrame) nextAction >>= go . DL.toList
 
-    eventValue :: MonadReadEvent t m => EventHandle t a -> m (Maybe a)
-    eventValue = readEvent >=> T.sequenceA
+      eventValue :: MonadReadEvent t m => EventHandle t a -> m (Maybe a)
+      eventValue = readEvent >=> T.sequenceA
 
   runMaybeT $ do
     go =<< lift (runHostFrame (DL.toList <$> getAp triggersToFire))
     return (chan, fmap isJust . runMaybeT . go)
+
 --------------------------------------------------------------------------------
 
 -- | Class providing common functionality for implementing reflex frameworks.
@@ -283,9 +310,19 @@ initHostApp app = do
 -- implemented generically. An implementation is the 'AppHost' monad.
 --
 -- Much of the functionality of this class is also provided by its superclasses.
-class (ReflexHost t, MonadSample t m, MonadHold t m, MonadReflexCreateTrigger t m,
-       MonadIO m, MonadIO (HostFrame t), MonadFix m, MonadFix (HostFrame t))
-      => MonadAppHost t m | m -> t where
+class
+  ( ReflexHost t,
+    MonadSample t m,
+    MonadHold t m,
+    MonadReflexCreateTrigger t m,
+    MonadIO m,
+    MonadIO (HostFrame t),
+    MonadFix m,
+    MonadFix (HostFrame t)
+  ) =>
+  MonadAppHost t m
+    | m -> t
+  where
   -- | Primitive function to create events from external sources.
   --
   -- In reflex, when you create an event (using 'newEventWithTrigger' for example),
